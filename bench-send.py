@@ -16,6 +16,8 @@ from multiprocessing import Process, current_process, Manager
 
 import numpy as np
 import pika
+from pika import DeliveryMode
+import pika.exceptions
 import psutil
 
 def format_bytes(size_in_bytes):
@@ -80,7 +82,8 @@ def create_connection(config: dict, cacert: str = None) -> pika.BlockingConnecti
         port=config["service-port"],
         virtual_host=config["rabbitmq-vhost"],
         credentials=credentials,
-        ssl_options=ssl_options
+        ssl_options=ssl_options,
+        heartbeat=0
     )
 
     return pika.BlockingConnection(parameters)
@@ -89,58 +92,97 @@ def send_messages_process(config, cacert, exchange, exchange_type, routing_key, 
     process = psutil.Process(os.getpid())
     connection = create_connection(config, cacert)
     channel = connection.channel()
+
     if exchange == '':
         result = channel.queue_declare(queue = routing_key, exclusive = False, durable = False, auto_delete = False)
         if verbose:
-            print(f"[Send {process_index}] Declared queue '{result.method.queue}'")
+            print(f"[Send {process_index}/{time.perf_counter()}] Declared queue '{result.method.queue}'")
     else:
         channel.exchange_declare(exchange = exchange, exchange_type = exchange_type, auto_delete = False)
         if verbose:
-            print(f"[Send {process_index}] Declared exchange '{exchange}'")
+            print(f"[Send {process_index}/{time.perf_counter()}] Declared exchange '{exchange}'")
 
     total_size = 0
     start = time.perf_counter()
     cpu_percent = []
     mem_usage = []
+    start_timing = 0
+    end_timing = []
 
     if exchange_type == "topic":
         rkey = f"{routing_key}.{process_index}"
     else:
         rkey = routing_key
 
-    for i in range(num_messages):
-        data = np.random.randint(0, 256, size=message_size, dtype=np.uint8)
-        message = data.tobytes()
+    confirm_delivery = False
 
-        channel.basic_publish(exchange=exchange, routing_key=rkey, body=message)
+    if confirm_delivery:
 
-        total_size += len(message)
-        if (i+1) % 1000 == 0:
-            print(f"[Send {process_index}] Sent message {i+1}/{num_messages} ({format_bytes(len(message))})")
+        # Turn on delivery confirmations
+        channel.confirm_delivery()
 
-        # Monitor CPU and memory
-        cpu_percent.append(process.cpu_percent(interval=None))  # non-blocking
-        mem_usage.append(process.memory_info().rss)
-        time.sleep(sleep_time)
+        message_sent = 0
+        for i in range(num_messages):
+            start_timing = time.perf_counter()
+            data = np.random.randint(0, 256, size=message_size, dtype=np.uint8)
+            message = data.tobytes()
+            
+            try:
+                channel.basic_publish(exchange=exchange, routing_key=rkey, body=message, properties=pika.BasicProperties(delivery_mode=DeliveryMode.Transient), mandatory=True)
+                message_sent +=1
+                total_size += len(message)
+                if verbose and (message_sent % 100 == 0) and message_sent > 0:
+                    print(f"[Send {process_index}/{time.perf_counter()}] Sent message to {exchange}/{rkey} => {i+1}/{num_messages} ({format_bytes(len(message))})")
+            except pika.exceptions.AMQPChannelError as e:
+                print(f"[Send {process_index}/{time.perf_counter()}] Message #{i} could not be confirmed {e}")
+
+            # Monitor CPU and memory
+            cpu_percent.append(process.cpu_percent(interval=None))  # non-blocking
+            mem_usage.append(process.memory_info().rss)
+            end_timing.append(time.perf_counter() - start_timing)
+            time.sleep(sleep_time)
+    else:
+        message_sent = 0
+        for i in range(num_messages):
+            start_timing = time.perf_counter()
+            data = np.random.randint(0, 256, size=message_size, dtype=np.uint8)
+            message = data.tobytes()
+            channel.basic_publish(exchange=exchange, routing_key=rkey, body=message, properties=pika.BasicProperties(delivery_mode=DeliveryMode.Transient))
+            message_sent +=1
+            total_size += len(message)
+            if verbose and (message_sent % 2000 == 0) and message_sent > 0:
+                print(f"[Send {process_index}/{time.perf_counter()}] Sent message to {exchange}/{rkey} => {i+1}/{num_messages} ({format_bytes(len(message))})")
+
+            # Monitor CPU and memory
+            cpu_percent.append(process.cpu_percent(interval=None))  # non-blocking
+            mem_usage.append(process.memory_info().rss)
+            end_timing.append(time.perf_counter() - start_timing)
+            time.sleep(sleep_time)
 
     end = time.perf_counter() - num_messages*(sleep_time)
+    duration_secs_sleep = sum(end_timing) + num_messages*(sleep_time)
     duration = end - start
-    bandwidth_gb = (total_size / 1e9) / duration if duration > 0 else 0
+    duration_loop = sum(end_timing)
+    bandwidth_gb = (total_size / (1024**3)) / duration if duration > 0 else 0
+    bandwidth_gb_loop = (total_size / (1024**3)) / duration_loop if duration_loop > 0 else 0
+    bandwidth_gb_sleep= (total_size / (1024**3)) / duration_secs_sleep if duration_secs_sleep > 0 else 0
 
     start_closing = time.perf_counter()
+
     channel.close()
     connection.close()
     end_closing = time.perf_counter() - start_closing
 
-    print(f"[Send {process_index}] Sent {num_messages} messages "
-            f"({format_bytes(total_size)}) in {duration:.2f}s ({bandwidth_gb:.6f} GB/s) (closing connection in {end_closing:.2f} secs)")
+    print(f"[Send {process_index}/{time.perf_counter()}] Sent {num_messages} messages to {exchange}/{rkey} "
+            f"({format_bytes(total_size)}) in {duration:.4f}s Pure ({bandwidth_gb_loop:.6f} GB/s | With sleep {bandwidth_gb_sleep:.6f} GB/s ) (closing connection in {end_closing:.2f} secs)")
 
     # Save monitoring stats to shared dictionary
     stats_dict[process_index] = {
         "messages_sent": num_messages,
         "total_bytes": total_size,
-        "duration_secs": duration,
-        "bandwidth_gbs": bandwidth_gb,
+        "duration_secs": duration_loop,
+        "duration_secs_sleep": duration_secs_sleep,
+        "bandwidth_gbs": bandwidth_gb_loop,
         "avg_cpu_percent": sum(cpu_percent)/len(cpu_percent) if cpu_percent else 0,
         "avg_memory_bytes": sum(mem_usage)/len(mem_usage) if mem_usage else 0,
     }
@@ -159,6 +201,7 @@ def main():
     parser.add_argument('--strong-scaling', action="store_true", help='Number of messages is divided by number of processes')
     parser.add_argument('--unique-id', '-id', required=False, help='Unique ID for CSV')
     parser.add_argument('--use-topic', '-topic', action="store_true", help='Use topic exchange and send messages to routing_key.process_id')
+    parser.add_argument('--routing-per-rank', action="store_true", help='Generate a unique routing key per process (cannot be used with -topic)')
 
     args = parser.parse_args()
 
@@ -170,6 +213,10 @@ def main():
     
     if args.nmsgs <= 0:
         print(f"Error parsing --nmsgs: {args.nmsgs} cannot be <= 0")
+        sys.exit(1)
+
+    if args.routing_per_rank and args.use_topic:
+        print(f"Error parsing --routing-per-rank cannot be used with --use-topic/-topic")
         sys.exit(1)
 
     manager = Manager()
@@ -190,10 +237,17 @@ def main():
         else:
             count = args.nmsgs
             messages_per_proc = args.nmsgs
+        
+        routing_key = args.routing_key
+        if args.routing_per_rank:
+            routing_key = f"{args.routing_key}.{i}"
+
+        # time.sleep(random)
+
         proc = Process(
             target = send_messages_process,
             args = (
-                config, cacert, args.exchange, exchange_type, args.routing_key,
+                config, cacert, args.exchange, exchange_type, routing_key,
                 count, message_size, args.verbose, args.sleep, i, stats_dict)
             )
         processes.append(proc)
@@ -202,26 +256,41 @@ def main():
     for proc in processes:
         proc.join()
 
-    bandwidth_gb = sum(stat["bandwidth_gbs"] for stat in stats_dict.values())
-    print(f"Sent {count} messages: aggregated bandwidth {bandwidth_gb:.6f} GB/s)")
+    bandwidth_gb = (sum(stat["total_bytes"] for stat in stats_dict.values())/(1024**3)) / max(stat["duration_secs"] for stat in stats_dict.values())
+    bandwidth_gb_sleep = (sum(stat["total_bytes"] for stat in stats_dict.values())/(1024**3)) / max(stat["duration_secs_sleep"] for stat in stats_dict.values())
 
     unique_id = args.unique_id or calendar.timegm(time.gmtime())
+
+    queue_opts = "queue_multi" if args.routing_per_rank else "queue_one"
+    used_exchange = f"exchange_{exchange_type}" if args.exchange !='' else queue_opts
+
+    msgs_sent = list(stat["messages_sent"] for stat in stats_dict.values())
+    total_message_sent = sum(msgs_sent)
+    agg_bandwidth_msgs = total_message_sent / max(stat["duration_secs"] for stat in stats_dict.values())
+    agg_bandwidth_msgs_sleep = total_message_sent / max(stat["duration_secs_sleep"] for stat in stats_dict.values())
+    
+    print(f"[Send/{time.perf_counter()}] Sent {total_message_sent} messages with {args.processes} processes: agg. bandwidth {bandwidth_gb:.6f} GB/s | Agg. with sleep {bandwidth_gb_sleep:.6f} GB/s")
+
+    print(f"[Send/{time.perf_counter()}] Total number of messages sent: {total_message_sent} | {agg_bandwidth_msgs} msg/s | With sleep {agg_bandwidth_msgs_sleep} msg/s | min={min(msgs_sent)} max={max(msgs_sent)}")
 
     if args.monitoring is not None:
         hostname = socket.gethostname()
         combined = {
             "exp_id": str(unique_id),
-            "total_messages": sum(stat["messages_sent"] for stat in stats_dict.values()),
+            "total_messages": total_message_sent,
             "num_processes": args.processes,
             "hostname": hostname,
-            "used_exchange": args.exchange !='',
+            "used_exchange": used_exchange,
             "sleep_time_secs": args.sleep,
             "messages_per_proc": messages_per_proc,
             "message_size": args.size,
             "message_count": args.nmsgs,
             "total_bytes": sum(stat["total_bytes"] for stat in stats_dict.values()),
-            "avg_bandwidth_gbs": sum(stat["bandwidth_gbs"] for stat in stats_dict.values()) / len(stats_dict),
-            "agg_bandwidth_gbs": sum(stat["bandwidth_gbs"] for stat in stats_dict.values()),
+            "avg_bandwidth_gbs": np.mean(list(stat["bandwidth_gbs"] for stat in stats_dict.values())),
+            "agg_bandwidth_gbs": bandwidth_gb,
+            "agg_bandwidth_gbs_sleep": bandwidth_gb_sleep,
+            "agg_bandwidth_msgs": agg_bandwidth_msgs,
+            "agg_bandwidth_msgs_sleep": agg_bandwidth_msgs_sleep,
             "avg_cpu_percent": sum(stat["avg_cpu_percent"] for stat in stats_dict.values()) / len(stats_dict),
             "avg_memory_bytes": sum(stat["avg_memory_bytes"] for stat in stats_dict.values()) / len(stats_dict),
             # "process_stats": dict(stats_dict)
@@ -236,7 +305,7 @@ def main():
             writer.writerow([val for key,val in combined.items()])
 
         if args.verbose:
-            print(f"Monitoring data written to {args.monitoring}")
+            print(f"[Send/{time.perf_counter()}] Monitoring data written to {args.monitoring}")
 
 if __name__ == '__main__':
     main()

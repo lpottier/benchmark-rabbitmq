@@ -53,37 +53,20 @@ def create_connection(config: dict, cacert: str = None) -> pika.BlockingConnecti
         port=config["service-port"],
         virtual_host=config["rabbitmq-vhost"],
         credentials=credentials,
-        ssl_options=ssl_options,
-        heartbeat=0
+        ssl_options=ssl_options
     )
 
     return pika.BlockingConnection(parameters)
 
-def consume_worker(config, cacert, exchange, queue, routing_key, process_index, stats_dict, max_messages, timeout, qos, epsilon_percent, sleep_sender, verbose):
+def consume_worker(config, cacert, queue, process_index, stats_dict, max_messages, timeout, qos, sleep_sender, verbose):
     proc = psutil.Process(os.getpid())
-    
-    start_init = time.perf_counter()
     connection = create_connection(config, cacert)
     channel = connection.channel()
-
-    if queue == '' and exchange != '':
-        channel.exchange_declare(exchange = exchange, exchange_type = 'direct', auto_delete = False)
-        if verbose:
-            print(f"[Recv {process_index}/{time.perf_counter()}] Declared exchange '{exchange}'")
-
+    
     result = channel.queue_declare(queue = queue, exclusive = False, durable = False, auto_delete = False)
     queue_name = result.method.queue
     if verbose:
-        print(f"[Recv {process_index}/{time.perf_counter()}] Declared queue '{queue_name}'")
-
-    if exchange != '':
-        if not isinstance(routing_key, list):
-            routing_key = [routing_key]
-
-        for key in routing_key:
-            channel.queue_bind(exchange = exchange, queue = queue_name, routing_key = key)
-            if verbose:
-                print(f"[Recv {process_index}/{time.perf_counter()}] Bound queue '{queue_name}' to exchange '{exchange}' with routing key '{key}'")
+        print(f"[Recv {process_index}] Declared queue '{queue_name}'")
 
     start_ts = time.perf_counter()
     stats = {
@@ -94,8 +77,6 @@ def consume_worker(config, cacert, exchange, queue, routing_key, process_index, 
         "end_time": None
     }
 
-    if verbose:
-        print(f"[Recv {process_index}/{time.perf_counter()}] Setting qos = {qos}")
     channel.basic_qos(prefetch_count = qos)
 
     cpu_percent = []
@@ -109,22 +90,22 @@ def consume_worker(config, cacert, exchange, queue, routing_key, process_index, 
 
     if verbose:
         if timeout:
-            print(f"[Recv {process_index}/{time.perf_counter()}] Waiting for {print_nmsgs} messages on queue '{queue_name}' with {timeout} seconds timout. Press Ctrl+C to exit.")
+            print(f"[Recv {process_index}] Waiting for {print_nmsgs} messages on queue '{queue_name}' with {timeout} seconds timout. Press Ctrl+C to exit.")
         else:
-            print(f"[Recv {process_index}/{time.perf_counter()}] Waiting for {print_nmsgs} messages on queue '{queue_name}', no timeout. Press Ctrl+C to exit.")
+            print(f"[Recv {process_index}] Waiting for {print_nmsgs} messages on queue '{queue_name}', no timeout. Press Ctrl+C to exit.")
 
     def callback(ch, method, properties, body):
         nonlocal peak_rss, start_general
         if start_general is None:
             start_general = time.perf_counter()
         stats["messages_received"] += 1
-        start_cb = time.perf_counter()
-
+        start = time.perf_counter()
+        
         #NOTE: This line drops the bandwidth by ~30x
         # ch.basic_ack(delivery_tag = method.delivery_tag)
 
         data = np.frombuffer(body, dtype=np.uint8)
-        end_cb = time.perf_counter()
+        end = time.perf_counter()
 
         # Monitoring
         cpu_percent.append(proc.cpu_percent(interval=None))
@@ -132,16 +113,11 @@ def consume_worker(config, cacert, exchange, queue, routing_key, process_index, 
         mem_usage.append(current_rss)
         if current_rss > peak_rss:
             peak_rss = current_rss
-        return end_cb - start_cb, data.nbytes
 
-    relaxed_bounds = round(nmsgs * (1-(epsilon_percent/100.0)))
-    interval_msgs = [max(0, nmsgs-relaxed_bounds), nmsgs+relaxed_bounds]
+        return end - start, data.nbytes
 
     end = None
-    end_init = time.perf_counter() - start_init
-
-    print(f"[Recv {process_index}/{time.perf_counter()}] Waiting for {nmsgs} messages (initialization done in {end_init})", flush=True)
-
+    print(f"[Recv {process_index}] Waiting for {nmsgs} messages")
     try:
         callback_duration = 0
         total_size = 0
@@ -151,85 +127,82 @@ def consume_worker(config, cacert, exchange, queue, routing_key, process_index, 
             if (method_frame, properties, body) == (None, None, None):
                 end = time.perf_counter()
                 closing_time = time.perf_counter()
-                print(f"[Recv {process_index}/{time.perf_counter()}] Timed out after {timeout} seconds (messages received: {message_consumed})")
+                print(f"[Recv {process_index}] Timed out after {timeout} seconds (messages received: {message_consumed})")
                 try:
                     requeued_messages = channel.cancel()
                 except Exception as e:
                     if verbose:
-                        print(f"[Recv {process_index}/{time.perf_counter()}] {e}")
+                        print(f"[Recv {process_index}] {e}")
                     requeued_messages = 0
                 if requeued_messages > 0 and verbose:
-                    print(f"[Recv {process_index}/{time.perf_counter()}] requeued {requeued_messages} messages")
+                    print(f"[Recv {process_index}] requeued {requeued_messages} messages")
                 # Close the channel and the connection
-                channel.stop_consuming()
                 try:
                     channel.close()
                 except Exception as e:
                     if verbose:
-                        print(f"[Recv {process_index}/{time.perf_counter()}] {e}")
+                        print(f"[Recv {process_index}] {e}")
                     pass
                 closing_time = time.perf_counter() - closing_time
-                print(f"[Recv {process_index}/{time.perf_counter()}] Closing channel time {closing_time} secs")
+                print(f"[Recv {process_index}] Closing channel time {closing_time} secs")
                 break
 
             duration, dsize = callback(channel, method_frame, properties, body)
-
             channel.basic_ack(delivery_tag = method_frame.delivery_tag)
-
-            if verbose and (message_consumed % 500 == 0) and message_consumed > 0:
-                print(f"[Recv {process_index}/{time.perf_counter()}] Received {message_consumed} messages")
+            if verbose:
+                print(f"[Recv {process_index}] Received message (queue={queue_name}): {format_bytes(dsize)}")
             callback_duration += duration
             total_size += dsize
 
-            message_consumed += 1
             stats["last_received_msg"] = time.perf_counter()
+            message_consumed += 1
             # if n_msgs is None, consume for ever
-            if message_consumed >= interval_msgs[0] and message_consumed <= interval_msgs[1]:
+            if message_consumed == nmsgs:
                 end = time.perf_counter()
-                print(f"[Recv {process_index}/{time.perf_counter()}] Consumed {message_consumed} messages. Stopping")
+                print(f"[Recv {process_index}] Consumed {message_consumed} messages. Stopping")
                 closing_time = time.perf_counter()
                 # Cancel the consumer and return any pending messages
                 try:
                     requeued_messages = channel.cancel()
                 except Exception as e:
-                    print(f"[Recv {process_index}/{time.perf_counter()}] {e}")
+                    if verbose: 
+                        print(f"[Recv {process_index}] {e}")
                     requeued_messages = 0
                 if requeued_messages > 0 and verbose:
-                    print(f"[Recv {process_index}/{time.perf_counter()}] requeued {requeued_messages} messages")
+                    print(f"[Recv {process_index}] requeued {requeued_messages} messages")
                 # Close the channel and the connection
-                channel.stop_consuming()
                 try:
                     channel.close()
                 except Exception as e:
                     if verbose:
-                        print(f"[Recv {process_index}/{time.perf_counter()}] {e}")
+                        print(f"[Recv {process_index}] {e}")
                     pass
                 closing_time = time.perf_counter() - closing_time
                 if verbose:
-                    print(f"[Recv {process_index}/{time.perf_counter()}] Closing channel time {closing_time} secs")
+                    print(f"[Recv {process_index}] Closing channel time {closing_time} secs")
                 break
     except KeyboardInterrupt:
-        print(f"[Recv {process_index}/{time.perf_counter()}] Interrupted. Closing connection...")
+        print(f"[Recv {process_index}] Interrupted. Closing connection...")
         print("")
         end = time.perf_counter()
         closing_time = time.perf_counter()
         try:
             requeued_messages = channel.cancel()
         except Exception as e:
-            print(f"[Recv {process_index}] {e}")
+            if verbose:
+                print(f"[Recv {process_index}] {e}")
             requeued_messages = 0
         if requeued_messages > 0 and verbose:
-            print(f"[Recv {process_index}/{time.perf_counter()}] requeued {requeued_messages} messages")
+            print(f"[Recv {process_index}] requeued {requeued_messages} messages")
         # Close the channel and the connection
-        channel.stop_consuming()
         try:
             channel.close()
         except Exception as e:
             if verbose:
-                print(f"[Recv {process_index}/{time.perf_counter()}] {e}")
+                print(f"[Recv {process_index}] {e}")
             pass
         closing_time = time.perf_counter() - closing_time
-        print(f"[Recv {process_index}/{time.perf_counter()}] Closing channel time {closing_time} secs")
+        print(f"[Recv {process_index}] Closing channel time {closing_time} secs")
     finally:
         start_closing_conn = time.perf_counter()
         try:
@@ -237,9 +210,7 @@ def consume_worker(config, cacert, exchange, queue, routing_key, process_index, 
         except pika.exceptions.ConnectionWrongStateError as e:
             pass
 
-        if end is None:
-            end = time.perf_counter()
-        stats["end_time"] = end
+        stats["end_time"] = end or time.perf_counter()
         stats["avg_cpu_percent"] = sum(cpu_percent) / len(cpu_percent) if cpu_percent else 0
         stats["avg_memory_bytes"] = sum(mem_usage) / len(mem_usage) if mem_usage else 0
         stats["peak_memory_bytes"] = peak_rss
@@ -247,7 +218,7 @@ def consume_worker(config, cacert, exchange, queue, routing_key, process_index, 
         cpu_times = proc.cpu_times()
         stats["cpu_time_user_secs"] = cpu_times.user
         stats["cpu_time_system_secs"] = cpu_times.system
-
+        
         if start_general is None:
             real_duration = -1
         else:
@@ -276,142 +247,62 @@ def consume_worker(config, cacert, exchange, queue, routing_key, process_index, 
         end_closing_conn = time.perf_counter() - start_closing_conn
         print(f"[Recv {process_index}/{time.perf_counter()}] Done (Closing done in {end_closing_conn:.2f} sec / {message_consumed} messages consumed)")
 
-def slice_list(array, n, prefix=''):
-    new_data = [x.tolist() for x in np.array_split(array, n)]
-    if prefix == '':
-        return new_data
-
-    new_data_prefix = []
-    for sub_list in new_data:
-        new_data_prefix.append([f"{prefix}.{x}" for x in sub_list])
-    return new_data_prefix
 
 def main():
-    parser = argparse.ArgumentParser(description='Multiprocess RabbitMQ consumer.')
+    parser = argparse.ArgumentParser(
+        description="Multiprocess RabbitMQ consumer that waits on N named queues where N is the number of processes. Queues are named as follow 'queue.K' where 0<=K<=N.")
     parser.add_argument('--config', required=True, help='RabbitMQ config file')
     parser.add_argument('--queue', '-q', required=False, default='', help='Queue name to consume from')
     parser.add_argument('--processes', '-p', type=int, default=1, help='Number of consumer processes')
     parser.add_argument('--timeout', '-t', required=False, default=None, type=int, help='Timeout in seconds (default: None)')
     parser.add_argument('--nmsgs', '-n', required=False, type=int, default=None, help='Number of messages to expect per process')
-    parser.add_argument('--exchange', '-e', required=False, default='', help='Exchange name to send messages to.')
-    parser.add_argument('--routing-key', '-r', required=False, help='Routing key to receive messages from.')
     parser.add_argument('--verbose', '-v', action="store_true", help='Verbose output')
     parser.add_argument('--monitoring', '-m', required=False, help='Write monitoring output CSV')
-    parser.add_argument('--qos', default=0, type=int, help='QOS level')
+    parser.add_argument('--qos', default=0, help='QOS level')
     parser.add_argument('--unique-id', '-id', required=False, help='Unique ID for CSV')
     parser.add_argument('--strong-scaling', action="store_true", help='Number of messages is divided by number of processes')
-    parser.add_argument('--routing-per-rank', action="store_true", help='Expect a unique routing key per process (cannot be used with -topic)')
-    parser.add_argument('--yappi', action="store_true", help='use yappi to profile the code')
-    parser.add_argument('--epsilon-percent', default=100, type=float, help='Consumer will stop when the number of messages "nmsgs * epsilon-percent" is received')
-    parser.add_argument('--sender-process', default=None, type=int, required=False, help='Number of senders processes')
     parser.add_argument('--sleep-sender', default=0, type=float, required=False, help='Time in seconds each sender wait (wait_time x nmsgs_sent). This time will be subtracted from the duration used to compute various metrics')
 
     args = parser.parse_args()
-
-    start_init = time.perf_counter()
 
     config = load_config(args.config)
     cacert = config.get("rabbitmq-cert")
     manager = Manager()
     stats_dict = manager.dict()
 
-    if args.queue == '' and args.exchange == '':
-        print(f"Error: either queue or exchange must be provided")
-        return
-
-    if args.queue != '' and args.exchange != '':
-        print(f"Error: queue and exchange connot be both provided")
-        return
-
-    if args.exchange != '' and args.routing_key == '':
-        print(f"Error: if exchange is provided then routing key cannot be null")
-        return
-
-    if args.routing_per_rank and args.routing_key == '':
-        print(f"Error: if --routing-per-rank is provided then --routing-key must be provided")
-        return
-
-    if args.epsilon_percent > 100 or args.epsilon_percent <= 0:
-        print(f"Error: --epsilon-percent must be between 0 and 100")
-        return
-    
-    if args.sender_process is None and not args.routing_per_rank:
-        print(f"Error: --sender-process must be used with --routing-per-rank")
-        return
-
-    if args.yappi:
-        import yappi
-        yappi.start()
-
-    end_init = time.perf_counter() - start_init
-    print(f"[Recv/{time.perf_counter()}] Initialization: {end_init} sec")
-
-    # If the number of senders is != of the number of consumers we must group bindings
-    # For example: with 5 producers and 2 consumers:
-    #    First consumer will have routing key [key.0, key.1, key.2]
-    #    Second consumer will have routing key [key.3, key.4]
-    if args.sender_process:
-        binding_keys = slice_list(list(range(args.sender_process)), args.processes, args.routing_key)
-
-    # Distribute messages evenly
-    messages_per_proc = None
-    messages_per_procs = []
-
     sleep_sender = args.sleep_sender * args.nmsgs
     if sleep_sender > 0:
         print(f"Sleep time per receiver = {sleep_sender} secs")
 
-    if args.sender_process and args.nmsgs:
-        # Weak scaling case
-        args.nmsgs = args.nmsgs * args.sender_process
-        print(f"Weak scaling case: total nmsgs: {args.nmsgs}")
-
+    # Distribute messages evenly
+    messages_per_proc = None
     if args.nmsgs:
         messages_per_proc = args.nmsgs // args.processes
         extra = args.nmsgs % args.processes
         processes = []
         for i in range(args.processes):
-            if args.strong_scaling or args.sender_process:
-                messages_per_procs.append(messages_per_proc + (1 if i < extra else 0))
+            if args.strong_scaling:
+                count = messages_per_proc + (1 if i < extra else 0)
             else:
-                messages_per_procs.append(args.nmsgs)
-
-    # print(f"messages_per_procs = {messages_per_procs}")
-    # if args.sender_process:
-    #     if sum(messages_per_procs) != args.nmsgs:
-    #         print(f"Weird = {sum(messages_per_procs)} {args.nmsgs}")
+                count = args.nmsgs
+                messages_per_proc = args.nmsgs
 
     processes = []
     for i in range(args.processes):
-        routing_key = args.routing_key
-        queue = args.queue
-        if args.routing_per_rank and args.sender_process is None:
-            routing_key = f"{args.routing_key}.{i}"
-        elif args.routing_per_rank and args.sender_process:
-            routing_key = binding_keys[i]
-        
-        if args.queue and args.routing_per_rank:
-            queue = f"{args.queue}.{i}"
-
+        queue_name = f"{args.queue}.{i}"
         proc = Process(target=consume_worker,
-                       args=(config, cacert, args.exchange, queue, routing_key, i, stats_dict, messages_per_procs[i], args.timeout, args.qos, args.epsilon_percent, sleep_sender, args.verbose))
+                       args=(config, cacert, queue_name, i, stats_dict, messages_per_proc, args.timeout, args.qos, sleep_sender, args.verbose))
         proc.start()
         processes.append(proc)
 
     for proc in processes:
         proc.join()
     
-    if args.yappi:
-        yappi.stop()
-        yappi.get_func_stats().print_all()
-        print("========")
-        yappi.get_thread_stats().print_all()
-    
     min_wait_time = max_wait_time = 0
     if len(stats_dict) == 0:
-        print(f"[Recv/{time.perf_counter()}] Warning: No stats collected")
+        print(f"Warning: No stats collected")
         return
-
+    
     min_wait_time = min(stat["wait_time_percent"] for stat in stats_dict.values())
     max_wait_time = max(stat["wait_time_percent"] for stat in stats_dict.values())
 
@@ -430,8 +321,7 @@ def main():
 
     unique_id = args.unique_id or calendar.timegm(time.gmtime())
 
-    queue_opts = "queue_multi" if args.routing_per_rank else "queue_one"
-    used_exchange = "exchange_direct" if args.exchange != '' else queue_opts
+    used_exchange = "queue_multi"
 
     if args.monitoring is not None:
         hostname = socket.gethostname()
@@ -440,7 +330,7 @@ def main():
             "total_messages": sum(stat["messages_received"] for stat in stats_dict.values()),
             "nmsgs": args.nmsgs,
             "num_processes": args.processes,
-            "sender_process": args.sender_process or -1,
+            "sender_process": args.processes,
             "qos": args.qos,
             "hostname": hostname,
             "used_exchange": used_exchange,
@@ -475,7 +365,7 @@ def main():
             writer.writerow([val for key,val in total.items()])
 
         if args.verbose:
-            print(f"[Recv/{time.perf_counter()}] Monitoring data written to {args.monitoring}")
+            print(f"Monitoring data written to {args.monitoring}")
 
 if __name__ == '__main__':
     main()

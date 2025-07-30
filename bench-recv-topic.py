@@ -66,9 +66,9 @@ def consume_worker(config, cacert, exchange, exchange_type, queue, binding_keys,
     if queue == '' and exchange != '':
         channel.exchange_declare(exchange = exchange, exchange_type = exchange_type, auto_delete = False)
         if verbose:
-            print(f"[Recv {process_index}] Declared exchange '{exchange}'")
+            print(f"[Recv {process_index}] Declared exchange '{exchange}' with type {exchange_type}")
 
-    result = channel.queue_declare(queue = queue, exclusive = False, durable = False, auto_delete = False)
+    result = channel.queue_declare(queue = queue, exclusive = False, durable = False, auto_delete = True)
     queue_name = result.method.queue
     if verbose:
         print(f"[Recv {process_index}] Declared queue '{queue_name}'")
@@ -136,7 +136,8 @@ def consume_worker(config, cacert, exchange, exchange_type, queue, binding_keys,
         total_duration = 0
         total_size = 0
         message_consumed = 0
-        # Get X messages and break out
+
+        # # Get X messages and break out
         for method_frame, properties, body in channel.consume(queue_name, inactivity_timeout = timeout):
             if (method_frame, properties, body) == (None, None, None):
                 end = time.perf_counter()
@@ -146,15 +147,18 @@ def consume_worker(config, cacert, exchange, exchange_type, queue, binding_keys,
                 if requeued_messages > 0 and verbose:
                     print(f"[Recv {process_index}] requeued {requeued_messages} messages")
                 # Close the channel and the connection
+                channel.stop_consuming()
                 channel.close()
+
                 closing_time = time.perf_counter() - closing_time
                 print(f"[Recv {process_index}] Closing channel time {closing_time} secs")
                 break
 
             duration, dsize = callback(channel, method_frame, properties, body)
             channel.basic_ack(delivery_tag = method_frame.delivery_tag)
-            if verbose:
-                print(f"[Recv {process_index}] Received message: {format_bytes(dsize)}")
+
+            if verbose and (message_consumed % 500 == 0) and message_consumed > 0:
+                print(f"[Recv {process_index}] Received {message_consumed} messages")
             total_duration += duration
             total_size += dsize
 
@@ -169,11 +173,13 @@ def consume_worker(config, cacert, exchange, exchange_type, queue, binding_keys,
                 if requeued_messages > 0 and verbose:
                     print(f"[Recv {process_index}] requeued {requeued_messages} messages")
                 # Close the channel and the connection
+                channel.stop_consuming()
                 channel.close()
                 closing_time = time.perf_counter() - closing_time
                 if verbose:
                     print(f"[Recv {process_index}] Closing channel time {closing_time} secs")
                 break
+
     except KeyboardInterrupt:
         print(f"[Recv {process_index}] Interrupted. Closing connection...")
         print("")
@@ -201,13 +207,19 @@ def consume_worker(config, cacert, exchange, exchange_type, queue, binding_keys,
         stats["cpu_time_system_secs"] = cpu_times.system
         
         bandwidth_gb = (total_size/1e9) / total_duration if total_duration > 0 else 0
-        real_duration = end - start_general
+
+        if start_general is None:
+            real_duration = -1
+        else:
+            real_duration = end - start_general
 
         stats["total_size_gb"] = total_size / 1e9
         stats["real_duration_secs"] = real_duration
         stats["bandwidth_gbs"] = bandwidth_gb
         stats["bandwidth_gbs_wait"] = (total_size/1e9) / real_duration if real_duration > 0 else 0
         stats["wait_time_percent"] = 100 * (real_duration - total_duration) / real_duration
+
+        print(stats)
 
         stats_dict[process_index] = stats
         end_closing_conn = time.perf_counter() - start_closing_conn
@@ -265,6 +277,11 @@ def main():
     exchange_type = "topic"
 
     binding_keys = [f"{args.routing_key}.{i}" for i in range(args.sender_process)]
+
+    if args.sender_process % args.processes != 0:
+        print(f"Warning: --sender-process must divide --processes")
+        sys.exit(-1)
+
     keys_per_process = args.sender_process // args.processes
     if keys_per_process == 0:
         binding_keys = binding_keys * args.processes
@@ -294,21 +311,24 @@ def main():
     bandwidth_gbs = sum(stat["bandwidth_gbs"] for stat in stats_dict.values())
     bandwidth_gbs_wait = sum(stat["bandwidth_gbs_wait"] for stat in stats_dict.values())
 
-    total_messages = sum(stat["messages_received"] for stat in stats_dict.values())
-    print(f"Total number of messages received: {total_messages}")
+    msgs_received = list(stat["messages_received"] for stat in stats_dict.values())
+    total_messages = sum(msgs_received)
+    print(f"Total number of messages received: {total_messages} | min={min(msgs_received)} max={max(msgs_received)}")
     print(f"No-wait agg. bandwith {bandwidth_gbs} GB/s | Wait agg. bandwidth {bandwidth_gbs_wait} GB/s ({max_wait_time} %)")
 
     unique_id = args.unique_id or calendar.timegm(time.gmtime())
+    used_exchange = f"exchange_{exchange_type}"
 
     if args.monitoring is not None:
         hostname = socket.gethostname()
         total = {
             "exp_id": str(unique_id),
             "total_messages": total_messages,
+            "nmsgs": args.nmsgs,
             "num_processes": args.processes,
             "qos": args.qos,
             "hostname": hostname,
-            "used_exchange": args.exchange !='',
+            "used_exchange": used_exchange,
             "total_runtime_secs": max(stat["end_time"] for stat in stats_dict.values()) - 
                                 min(stat["start_time"] for stat in stats_dict.values()),
             "avg_cpu_percent": sum(stat["avg_cpu_percent"] for stat in stats_dict.values()) / len(stats_dict),
